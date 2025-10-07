@@ -1,25 +1,61 @@
+# =====================
+#  Document‑wide tests
+# =====================
 title = "Advanced Parser"
+description = """
+This is a multi‑line string.
+It tests the triple‑quote reader.
+"""
 start_time = 2025-10-07T08:00:00Z
+version = 1.2
+active = true
+
+# --------------------------------
+#  Inline table & simple array test
+# --------------------------------
+metadata = { author = "Deondre English", year = 2025, valid = true }
+tags = ["c", "toml", "parser", "writer"]
 
 [numbers]
-set = [1, 2, 3]
+ints = [1, 2, 3, 4]
+floats = [3.14, 2.71, 1.618]
+mixed_comment = [1, 2, 3]    # trailing comment
 
+# ----------------------
+#  Nested table test
+# ----------------------
 [server]
 host = "localhost"
 port = 8080
 secure = true
+# inline table nested inside table
+details = { os = "linux", cores = 8, ipv6 = false }
 
 [server.config]
 timeout = 30
+compression = "gzip"
 
-# implicit dotted keys
+# -----------------------
+#  Implicit dotted keys
+# -----------------------
 database.main.user = "admin"
 database.main.pass = "pass123"
+database.main.timeout = 60
 
+# ------------------------
+#  Array of tables section
+# ------------------------
 [[users]]
 name = "Alice"
 age = 30
+verified = true
 
 [[users]]
 name = "Bob"
 age = 25
+verified = false
+
+[[users]]
+name = "Charlie"
+age = 40
+verified = true

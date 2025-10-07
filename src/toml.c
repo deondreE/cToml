@@ -1,26 +1,27 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "toml.h"
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
-// ----------------------------------------------------------
-// Helpers
-// ----------------------------------------------------------
-
+// ------------------------------------------------------------
+// Utility helpers
+// ------------------------------------------------------------
 static void trim(char *s) {
-    char *start = s;
-    while (isspace((unsigned char)*start)) start++;
-    if (start != s) memmove(s, start, strlen(start) + 1);
-
+    char *p = s;
+    while (isspace((unsigned char)*p)) p++;
+    if (p != s) memmove(s, p, strlen(p) + 1);
     char *end = s + strlen(s) - 1;
     while (end >= s && isspace((unsigned char)*end)) end--;
     *(end + 1) = '\0';
 }
 
-static void err_add(TomlErrorList *elist, int line, char *msg) {
+static bool starts_with(const char *s, const char *prefix) {
+    return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+static void err_add(TomlErrorList *elist, int line, const char *msg) {
     if (elist->count >= elist->cap) {
         elist->cap = elist->cap ? elist->cap * 2 : 8;
         elist->errors = realloc(elist->errors, elist->cap * sizeof(TomlError));
@@ -31,11 +32,13 @@ static void err_add(TomlErrorList *elist, int line, char *msg) {
     elist->count++;
 }
 
-static TomlEntry *toml_entry_add(TomlTable *t, const char *key) {
-    if (t->entry_count >= t->entry_capacity) {
-        t->entry_capacity = t->entry_capacity > 0 ? t->entry_capacity * 2 : 8;
-        t->entries =
-            realloc(t->entries, t->entry_capacity * sizeof(TomlEntry));
+// ------------------------------------------------------------
+// Table management
+// ------------------------------------------------------------
+static TomlEntry *entry_add(TomlTable *t, const char *key) {
+    if (t->entry_count >= t->entry_cap) {
+        t->entry_cap = t->entry_cap ? t->entry_cap * 2 : 8;
+        t->entries = realloc(t->entries, t->entry_cap * sizeof(TomlEntry));
     }
     TomlEntry *e = &t->entries[t->entry_count++];
     memset(e, 0, sizeof(TomlEntry));
@@ -43,162 +46,242 @@ static TomlEntry *toml_entry_add(TomlTable *t, const char *key) {
     return e;
 }
 
-static TomlTable *toml_table_add_sub(TomlTable *parent, const char *name) {
-    for (int i = 0; i < parent->sub_count; i++) {
-        if (strcmp(parent->subtables[i]->name, name) == 0)
-            return parent->subtables[i];
+static TomlTable *subtable_add(TomlTable *p, const char *name) {
+    for (int i = 0; i < p->sub_count; i++)
+        if (!strcmp(p->subtables[i]->name, name))
+            return p->subtables[i];
+    if (p->sub_count >= p->sub_cap) {
+        p->sub_cap = p->sub_cap ? p->sub_cap * 2 : 4;
+        p->subtables = realloc(p->subtables, p->sub_cap * sizeof(TomlTable *));
     }
-    if (parent->sub_count >= parent->sub_capacity) {
-        parent->sub_capacity = parent->sub_capacity > 0 ? parent->sub_capacity * 2 : 4;
-        parent->subtables =
-            realloc(parent->subtables, parent->sub_capacity * sizeof(TomlTable *));
-    }
-    TomlTable *child = calloc(1, sizeof(TomlTable));
-    strncpy(child->name, name, MAX_KEY_LEN - 1);
-    parent->subtables[parent->sub_count++] = child;
-    return child;
+    TomlTable *t = calloc(1, sizeof(TomlTable));
+    strncpy(t->name, name, MAX_KEY_LEN - 1);
+    p->subtables[p->sub_count++] = t;
+    return t;
 }
 
-static TomlTable *toml_table_ensure_path(TomlTable *root, const char *path) {
-    if (!path || *path == '\0') return root;
+static TomlTable *ensure_path(TomlTable *root, const char *path) {
+    if (!path || !*path) return root;
     char buf[256];
     strncpy(buf, path, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
-    trim(buf);
-
-    TomlTable *cur = root;
     char *tok = strtok(buf, ".");
+    TomlTable *cur = root;
     while (tok) {
-        cur = toml_table_add_sub(cur, tok);
+        cur = subtable_add(cur, tok);
         tok = strtok(NULL, ".");
     }
     return cur;
 }
 
-// ----------------------------------------------------------
-// Value Parsing
-// ----------------------------------------------------------
+// ------------------------------------------------------------
+// Datetime Parsing
+// ------------------------------------------------------------
+static bool parse_datetime(const char *src, TomlDatetime *out) {
+    int y, m, d, H = 0, M = 0, S = 0, tz_h = 0, tz_m = 0;
+    char tz[8] = "";
+    if (sscanf(src, "%d-%d-%dT%d:%d:%d%7s", &y, &m, &d, &H, &M, &S, tz) >= 3) {
+        out->year = y; out->month = m; out->day = d;
+        out->hour = H; out->minute = M; out->second = S;
+        out->has_time = strchr(src, 'T') || strchr(src, ' ');
+        if (tz[0] == 'Z') out->tz_offset = 0;
+        else if (tz[0] == '+' || tz[0] == '-') {
+            int sign = (tz[0] == '-') ? -1 : 1;
+            sscanf(tz + 1, "%d:%d", &tz_h, &tz_m);
+            out->tz_offset = sign * (tz_h * 60 + tz_m);
+        } else out->tz_offset = 0;
+        return true;
+    }
+    return false;
+}
 
-static TomlValueType parse_array(const char *val_text, TomlEntry *entry_out) {
+// ------------------------------------------------------------
+// Inline Table Parsing
+// ------------------------------------------------------------
+static TomlTable *parse_inline_table(const char *src) {
+    TomlTable *tbl = calloc(1, sizeof(TomlTable));
+    if (!tbl) return NULL;
+
+    // Make a local editable copy of the inline table block
     char buf[512];
-    strncpy(buf, val_text, sizeof(buf) - 1);
+    strncpy(buf, src, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
     trim(buf);
 
-    entry_out->value.array.length = 0;
-    if (strlen(buf) == 0)
-        return TOML_ARRAY_INT; // empty array default type
-
+    // Tokenize by comma
     char *token = strtok(buf, ",");
-    int int_count = 0, float_count = 0, str_count = 0;
-
-    while (token && entry_out->value.array.length < MAX_ARRAY_ITEMS) {
-        trim(token);
-        if (*token == '"' && token[strlen(token) - 1] == '"') {
-            token[strlen(token) - 1] = '\0';
-            token++;
-            strncpy(entry_out->value.array.string_values[str_count++],
-                    token, MAX_VAL_LEN - 1);
-        } else if (strchr(token, '.')) {
-            entry_out->value.array.float_values[float_count++] = atof(token);
-        } else if (*token != '\0') {
-            entry_out->value.array.int_values[int_count++] = atoi(token);
+    while (token) {
+        char *eq = strchr(token, '=');
+        if (!eq) {
+            token = strtok(NULL, ",");
+            continue;
         }
-        entry_out->value.array.length++;
+
+        *eq = '\0';
+        char key[MAX_KEY_LEN];
+        strncpy(key, token, sizeof(key) - 1);
+        key[sizeof(key) - 1] = '\0';
+        trim(key);
+
+        // writable buffer for the value portion
+        char val_buf[MAX_VAL_LEN];
+        strncpy(val_buf, eq + 1, sizeof(val_buf) - 1);
+        val_buf[sizeof(val_buf) - 1] = '\0';
+        trim(val_buf);
+
+        // pointer version so we can increment safely
+        char *val = val_buf;
+
+        TomlEntry *e = entry_add(tbl, key);
+
+        // String value
+        if (*val == '"' && val[strlen(val) - 1] == '"') {
+            val[strlen(val) - 1] = '\0';
+            val++;
+            e->type = TOML_STRING;
+            strncpy(e->value.str_val, val, MAX_VAL_LEN - 1);
+            e->value.str_val[MAX_VAL_LEN - 1] = '\0';
+
+        // Boolean
+        } else if (!strcmp(val, "true") || !strcmp(val, "false")) {
+            e->type = TOML_BOOL;
+            e->value.bool_val = !strcmp(val, "true");
+
+        // Float
+        } else if (strchr(val, '.')) {
+            e->type = TOML_FLOAT;
+            e->value.float_val = atof(val);
+
+        // Integer (fallback)
+        } else {
+            e->type = TOML_INT;
+            e->value.int_val = atoi(val);
+        }
+
         token = strtok(NULL, ",");
     }
 
-    if (str_count > 0)
-        return TOML_ARRAY_STRING;
-    else if (float_count > 0)
-        return TOML_ARRAY_FLOAT;
-    else
-        return TOML_ARRAY_INT;
+    return tbl;
 }
 
 // ------------------------------------------------------------
-// Multiline String and Datetime Detection
+// Array Parsing
 // ------------------------------------------------------------
-
-static bool starts_with(const char *s, const char *prefix) {
-    return strncmp(s, prefix, strlen(prefix)) == 0;
+static TomlValueType parse_array(const char *src, TomlEntry *e) {
+    char buf[512];
+    strncpy(buf, src, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    trim(buf);
+    e->value.array.length = 0;
+    if (!strlen(buf)) return TOML_ARRAY_INT;
+    char *tok = strtok(buf, ",");
+    int ints = 0, floats = 0, strs = 0;
+    while (tok && e->value.array.length < MAX_ARRAY_ITEMS) {
+        trim(tok);
+        if (*tok == '"' && tok[strlen(tok) - 1] == '"') {
+            tok[strlen(tok)-1] = '\0'; tok++;
+            strncpy(e->value.array.strings[strs++], tok, MAX_VAL_LEN - 1);
+        } else if (strchr(tok, '.')) {
+            e->value.array.floats[floats++] = atof(tok);
+        } else {
+            e->value.array.ints[ints++] = atoi(tok);
+        }
+        e->value.array.length++;
+        tok = strtok(NULL, ",");
+    }
+    if (strs) return TOML_ARRAY_STRING;
+    if (floats) return TOML_ARRAY_FLOAT;
+    return TOML_ARRAY_INT;
 }
 
-static bool looks_like_datetime(const char *s) {
-    return (strchr(s, 'T') && strchr(s, '-') && strchr(s, ':'));
-}
-
-// ----------------------------------------------------------
-// Loading / Parsing
-// ----------------------------------------------------------
-
+// ------------------------------------------------------------
+// Parser Core
+// ------------------------------------------------------------
 TomlDoc *toml_load(const char *filename) {
     FILE *f = fopen(filename, "r");
     if (!f) { fprintf(stderr, "cannot open %s\n", filename); return NULL; }
 
-    TomlDoc *d = calloc(1, sizeof(TomlDoc));
-    d->root = calloc(1, sizeof(TomlTable));
-    strncpy(d->root->name, "root", 4);
+    TomlDoc *doc = calloc(1, sizeof(TomlDoc));
+    doc->root = calloc(1, sizeof(TomlTable));
+    strncpy(doc->root->name, "root", sizeof(doc->root->name)-1);
 
-    char line[1024];
-    int lineno = 0;
-    char current_path[128] = "";
-    TomlTable *current = d->root;
+    char line[1024], current_path[128] = "";
+    TomlTable *current = doc->root;
+    int line_no = 0;
 
     while (fgets(line, sizeof(line), f)) {
-        lineno++;
+        line_no++;
         trim(line);
-        if (!*line || line[0] == '#') continue;
+        if (!*line) continue;
 
-        // Arrays of tables [[table]]
-        if (starts_with(line, "[[")) {
-            char buf[128];
-            strncpy(buf, line + 2, strlen(line) - 4);
-            buf[strlen(line) - 4] = '\0';
-            trim(buf);
-            current = ensure_path(d->root, buf);
-            current->is_array = true;
+        // Standalone comment
+        if (line[0] == '#') {
+            strncpy(current->comment, line + 1, sizeof(current->comment) - 1);
             continue;
         }
 
-        // Table [table]
-        if (line[0] == '[' && line[strlen(line)-1] == ']') {
+        // Table headers
+        if (starts_with(line, "[[")) { // array of tables
+            char name[128];
+            strncpy(name, line + 2, strlen(line) - 4);
+            name[strlen(line)-4] = '\0';
+            trim(name);
+            current = ensure_path(doc->root, name);
+            current->is_array = true;
+            continue;
+        } else if (line[0] == '[' && line[strlen(line)-1] == ']') {
             strncpy(current_path, line+1, strlen(line)-2);
             current_path[strlen(line)-2] = '\0';
             trim(current_path);
-            current = ensure_path(d->root, current_path);
+            current = ensure_path(doc->root, current_path);
             continue;
         }
 
-        // Key‑value
+        // key/value with potential comment
+        char *hash = strchr(line, '#');
+        char comment[128] = "";
+        if (hash) {
+            strncpy(comment, hash + 1, sizeof(comment) - 1);
+            *hash = '\0';
+        }
+
         char *eq = strchr(line, '=');
-        if (!eq) { err_add(&d->errs, lineno, "missing '='"); continue; }
+        if (!eq) { err_add(&doc->errs, line_no, "missing '='"); continue; }
         *eq = '\0';
         char keybuf[128]; strncpy(keybuf, line, sizeof(keybuf)-1); trim(keybuf);
         char *val = eq + 1; trim(val);
 
-        // implicit dotted key path
-        char key_path[128]; strncpy(key_path, keybuf, sizeof(key_path)-1);
-        char *final_key = strrchr(key_path, '.');
-        TomlTable *target =
-            final_key ? ensure_path(d->root, key_path) : current;
+        // dotted keys
+        char keycopy[128]; strncpy(keycopy, keybuf, sizeof(keycopy)-1);
+        char *final_key = strrchr(keycopy, '.');
+        TomlTable *target = final_key ? ensure_path(doc->root, keycopy) : current;
         if (final_key) {
             *final_key = '\0'; final_key++;
-        } else { final_key = keybuf; }
+        } else final_key = keybuf;
 
         TomlEntry *e = entry_add(target, final_key);
-        e->line_num = lineno;
+        e->line_num = line_no;
+        strncpy(e->comment, comment, sizeof(e->comment)-1);
 
-        // Multiline string
+        // Detect multiline string
         if (starts_with(val, "\"\"\"")) {
-            char buf[2048] = {0};
+            char buf[2048] = "";
             while (fgets(line, sizeof(line), f)) {
-                lineno++;
                 if (strstr(line, "\"\"\"")) break;
                 strcat(buf, line);
             }
             e->type = TOML_STRING;
-            strncpy(e->value.str_val, buf, MAX_VAL_LEN-1);
+            strncpy(e->value.str_val, buf, MAX_VAL_LEN - 1);
+            continue;
+        }
+
+        // Inline table
+        if (val[0] == '{' && val[strlen(val)-1] == '}') {
+            char inner[512];
+            strncpy(inner, val+1, strlen(val)-2);
+            inner[strlen(val)-2] = '\0';
+            e->type = TOML_TABLE;
+            e->value.table_val = parse_inline_table(inner);
             continue;
         }
 
@@ -213,27 +296,26 @@ TomlDoc *toml_load(const char *filename) {
 
         // String
         if (val[0] == '"' && val[strlen(val)-1] == '"') {
-            val[strlen(val)-1] = '\0'; val++;
+            val[strlen(val)-1]='\0'; val++;
             e->type = TOML_STRING;
             strncpy(e->value.str_val, val, MAX_VAL_LEN-1);
             continue;
         }
 
         // Bool
-        if (!strcmp(val, "true") || !strcmp(val, "false")) {
-            e->type = TOML_BOOL;
-            e->value.bool_val = !strcmp(val, "true");
+        if (!strcmp(val,"true")||!strcmp(val,"false")) {
+            e->type = TOML_BOOL; e->value.bool_val=!strcmp(val,"true");
             continue;
         }
 
         // Datetime
-        if (looks_like_datetime(val)) {
-            e->type = TOML_DATETIME;
-            strncpy(e->value.str_val, val, MAX_VAL_LEN-1); // stored raw
+        TomlDatetime dt;
+        if (parse_datetime(val, &dt)) {
+            e->type = TOML_DATETIME; e->value.datetime = dt;
             continue;
         }
 
-        // Numeric
+        // Number fallback
         if (strchr(val, '.')) {
             e->type = TOML_FLOAT; e->value.float_val = atof(val);
         } else {
@@ -242,205 +324,165 @@ TomlDoc *toml_load(const char *filename) {
     }
 
     fclose(f);
-    return d;
+    return doc;
 }
 
-// ----------------------------------------------------------
+// ------------------------------------------------------------
 // Accessors
-// ----------------------------------------------------------
-
-TomlTable *toml_table_get(TomlTable *parent, const char *name) {
-    if (!parent || !name) return NULL;
-    for (int i = 0; i < parent->sub_count; i++) {
-        if (strcmp(parent->subtables[i]->name, name) == 0)
-            return parent->subtables[i];
-    }
+// ------------------------------------------------------------
+TomlTable *toml_table_get(TomlTable *p, const char *name) {
+    for (int i=0;i<p->sub_count;i++)
+        if (!strcmp(p->subtables[i]->name,name))
+            return p->subtables[i];
     return NULL;
 }
 
-const TomlEntry *toml_entry_get(const TomlTable *t, const char *key) {
-    if (!t) return NULL;
-    for (int i = 0; i < t->entry_count; i++) {
-        if (strcmp(t->entries[i].key, key) == 0)
+const TomlEntry *toml_entry_get(const TomlTable *t,const char *key){
+    for (int i=0;i<t->entry_count;i++)
+        if (!strcmp(t->entries[i].key,key))
             return &t->entries[i];
-    }
     return NULL;
 }
 
-int toml_get_int(const TomlTable *t, const char *key, int def) {
-    const TomlEntry *e = toml_entry_get(t, key);
-    return (e && e->type == TOML_INT) ? e->value.int_val : def;
+int toml_get_int(const TomlTable *t,const char *k,int def){
+    const TomlEntry *e=toml_entry_get(t,k);
+    return (e&&e->type==TOML_INT)?e->value.int_val:def;
 }
-const char *toml_get_string(const TomlTable *t, const char *key,
-                            const char *def) {
-    const TomlEntry *e = toml_entry_get(t, key);
-    return (e && e->type == TOML_STRING) ? e->value.str_val : def;
+double toml_get_float(const TomlTable *t,const char *k,double def){
+    const TomlEntry *e=toml_entry_get(t,k);
+    return (e&&e->type==TOML_FLOAT)?e->value.float_val:def;
 }
-bool toml_get_bool(const TomlTable *t, const char *key, bool def) {
-    const TomlEntry *e = toml_entry_get(t, key);
-    return (e && e->type == TOML_BOOL) ? e->value.bool_val : def;
+bool toml_get_bool(const TomlTable *t,const char *k,bool def){
+    const TomlEntry *e=toml_entry_get(t,k);
+    return (e&&e->type==TOML_BOOL)?e->value.bool_val:def;
 }
-double toml_get_float(const TomlTable *t, const char *k, double def) {
-    const TomlEntry *e = toml_entry_get(t, k);
-    return (e && e->type == TOML_FLOAT) ? e->value.float_val : def;
+const char* toml_get_string(const TomlTable *t,const char *k,const char *def){
+    const TomlEntry *e=toml_entry_get(t,k);
+    return (e&&e->type==TOML_STRING)?e->value.str_val:def;
 }
 
-// ----------------------------------------------------------
-// Writer API
-// ----------------------------------------------------------
+// ------------------------------------------------------------
+// Validation
+// ------------------------------------------------------------
+TomlValidationCode toml_expect_type(const TomlTable *t, const char *key,
+                                    TomlValueType type) {
+    const TomlEntry *e = toml_entry_get(t, key);
+    if (!e) return TOML_ERR_MISSING_KEY;
+    if (e->type != type) return TOML_ERR_TYPE_MISMATCH;
+    return TOML_OK;
+}
 
-static void write_escaped_string(FILE *f, const char *s) {
-    fputc('"', f);
-    for (; *s; s++) {
-        switch (*s) {
-            case '\\': fputs("\\\\", f); break;
-            case '"':  fputs("\\\"", f); break;
-            case '\n': fputs("\\n", f); break;
-            case '\r': fputs("\\r", f); break;
-            case '\t': fputs("\\t", f); break;
-            default: fputc(*s, f); break;
-        }
+TomlValidationCode toml_require(const TomlTable *t, const char *key,
+                                TomlValueType type) {
+    TomlValidationCode v = toml_expect_type(t, key, type);
+    if (v == TOML_ERR_MISSING_KEY)
+        fprintf(stderr,"Missing key: %s in table %s\n",key,t->name);
+    else if (v == TOML_ERR_TYPE_MISMATCH)
+        fprintf(stderr,"Wrong type for key: %s in table %s\n",key,t->name);
+    return v;
+}
+
+// ------------------------------------------------------------
+// Writer
+// ------------------------------------------------------------
+static void write_indent(FILE *f,int lvl,int sp){for(int i=0;i<lvl*sp;i++)fputc(' ',f);}
+
+static void write_escaped_string(FILE *f,const char *s){
+    fputc('"',f);for(;*s;s++){switch(*s){
+        case '\\':fputs("\\\\",f);break;
+        case '"':fputs("\\\"",f);break;
+        case '\n':fputs("\\n",f);break;
+        case '\r':fputs("\\r",f);break;
+        case '\t':fputs("\\t",f);break;
+        default:fputc(*s,f);
+    }}fputc('"',f);
+}
+
+static void write_array(FILE *f,const TomlEntry *e){
+    fprintf(f,"[");
+    for(int i=0;i<e->value.array.length;i++){
+        if(i>0)fprintf(f,", ");
+        if(e->type==TOML_ARRAY_INT)fprintf(f,"%d",e->value.array.ints[i]);
+        else if(e->type==TOML_ARRAY_FLOAT)fprintf(f,"%g",e->value.array.floats[i]);
+        else if(e->type==TOML_ARRAY_STRING)write_escaped_string(f,e->value.array.strings[i]);
     }
-    fputc('"', f);
+    fprintf(f,"]");
 }
 
-// Write arrays: [1, 2, 3] or ["a", "b"]
-static void write_array(FILE *f, const TomlEntry *e) {
-    fprintf(f, "[");
-    for (int i = 0; i < e->value.array.length; i++) {
-        if (i > 0) fprintf(f, ", ");
-        switch (e->type) {
-            case TOML_ARRAY_INT:
-                fprintf(f, "%d", e->value.array.int_values[i]);
-                break;
-            case TOML_ARRAY_FLOAT:
-                fprintf(f, "%g", e->value.array.float_values[i]);
-                break;
-            case TOML_ARRAY_STRING:
-                write_escaped_string(f, e->value.array.string_values[i]);
-                break;
-            default:
-                break;
-        }
-    }
-    fprintf(f, "]");
-}
-
-static void write_indent(FILE *f, int level, int spaces) {
-    for (int i = 0; i < level * spaces; i++)
-        fputc(' ', f);
-}
-
-static void write_table(FILE *f, const TomlTable *t, int depth, int indent) {
-    // Write key-value pairs
-    for (int i = 0; i < t->entry_count; i++) {
-        const TomlEntry *e = &t->entries[i];
-        write_indent(f, depth, indent);
-        fprintf(f, "%s = ", e->key);
-        switch (e->type) {
-            case TOML_INT:
-                fprintf(f, "%d", e->value.int_val);
-                break;
-            case TOML_FLOAT:
-                fprintf(f, "%g", e->value.float_val);
-                break;
-            case TOML_BOOL:
-                fprintf(f, e->value.bool_val ? "true" : "false");
-                break;
-            case TOML_STRING:
-                write_escaped_string(f, e->value.str_val);
-                break;
+static void write_table(FILE *f,const TomlTable *t,int depth,int indent){
+    if(strlen(t->comment)>0)fprintf(f,"#%s\n",t->comment);
+    for(int i=0;i<t->entry_count;i++){
+        const TomlEntry *e=&t->entries[i];
+        write_indent(f,depth,indent);
+        fprintf(f,"%s = ",e->key);
+        switch(e->type){
+            case TOML_INT:fprintf(f,"%d",e->value.int_val);break;
+            case TOML_FLOAT:fprintf(f,"%g",e->value.float_val);break;
+            case TOML_BOOL:fprintf(f,e->value.bool_val?"true":"false");break;
+            case TOML_STRING:write_escaped_string(f,e->value.str_val);break;
             case TOML_ARRAY_INT:
             case TOML_ARRAY_FLOAT:
-            case TOML_ARRAY_STRING:
-                write_array(f, e);
-                break;
+            case TOML_ARRAY_STRING:write_array(f,e);break;
             case TOML_DATETIME:
-                fprintf(f, "%s", e->value.str_val);
+                fprintf(f,"%04d-%02d-%02dT%02d:%02d:%02dZ",
+                        e->value.datetime.year,e->value.datetime.month,
+                        e->value.datetime.day,e->value.datetime.hour,
+                        e->value.datetime.minute,e->value.datetime.second);
                 break;
-            default:
-                fprintf(f, "\"<unknown>\"");
+            case TOML_TABLE:
+                fprintf(f,"{"); for(int j=0;j<e->value.table_val->entry_count;j++){
+                    const TomlEntry *ie=&e->value.table_val->entries[j];
+                    if(j>0)fprintf(f,", ");
+                    fprintf(f,"%s = ",ie->key);
+                    if(ie->type==TOML_STRING)write_escaped_string(f,ie->value.str_val);
+                    else if(ie->type==TOML_INT)fprintf(f,"%d",ie->value.int_val);
+                    else if(ie->type==TOML_BOOL)fprintf(f,ie->value.bool_val?"true":"false");
+                    else if(ie->type==TOML_FLOAT)fprintf(f,"%g",ie->value.float_val);
+                } fprintf(f,"}");
                 break;
         }
-        fprintf(f, "\n");
+        if(strlen(e->comment)>0)fprintf(f,"  # %s",e->comment);
+        fprintf(f,"\n");
     }
-
-    // Write subtables
-    for (int i = 0; i < t->sub_count; i++) {
-        fprintf(f, "\n");
-        const TomlTable *st = t->subtables[i];
-        write_indent(f, depth, indent);
-        fprintf(f, "[%s]\n", st->name);
-        write_table(f, st, depth + 1, indent);
-    }
-
-    // Write array-of-tables, if any
-    for (int i = 0; i < t->arr_count; i++) {
-        fprintf(f, "\n");
-        const TomlTable *inst = t->table_array[i];
-        write_indent(f, depth, indent);
-        fprintf(f, "[[%s]]\n", inst->name);
-        write_table(f, inst, depth + 1, indent);
+    for(int i=0;i<t->sub_count;i++){
+        fprintf(f,"\n");
+        const TomlTable *st=t->subtables[i];
+        write_indent(f,depth,indent);fprintf(f,"[%s]\n",st->name);
+        write_table(f,st,depth+1,indent);
     }
 }
 
-int toml_write(const TomlDoc *doc, const char *filename,
-               const TomlWriteOptions *opts) {
-    if (!doc || !doc->root) return -1;
-    FILE *f = fopen(filename, "w");
-    if (!f) return -1;
-    int indent = (opts && opts->indent_spaces) ? opts->indent_spaces : 0;
-    write_table(f, doc->root, 0, indent);
-    fclose(f);
-    return 0;
+int toml_write(const TomlDoc *doc,const char *file,const TomlWriteOptions *opts){
+    FILE *f=fopen(file,"w"); if(!f)return -1;
+    int ind=opts?opts->indent_spaces:0;
+    write_table(f,doc->root,0,ind);
+    fclose(f); return 0;
 }
 
-// ----------------------------------------------------------
-// Cleanup
-// ----------------------------------------------------------
-
-static void dump_table(const TomlTable *t, int depth) {
-    for (int i = 0; i < t->entry_count; i++) {
-        for (int d = 0; d < depth; d++) printf("  ");
-        const TomlEntry *e = &t->entries[i];
-        printf("%s = ", e->key);
-        switch (e->type) {
-            case TOML_INT: printf("%d", e->value.int_val); break;
-            case TOML_FLOAT: printf("%f", e->value.float_val); break;
-            case TOML_BOOL: printf("%s", e->value.bool_val?"true":"false"); break;
-            case TOML_STRING: printf("\"%s\"", e->value.str_val); break;
-            case TOML_ARRAY_INT:
-                printf("[ "); for (int j=0;j<e->value.array.length;j++)
-                    printf("%d ", e->value.array.int_values[j]); printf("]");
-                break;
-            case TOML_DATETIME: printf("%s", e->value.str_val); break;
-            default: printf("..."); break;
-        }
-        printf("\n");
+// ------------------------------------------------------------
+// Dump / Free
+// ------------------------------------------------------------
+static void dump_table(const TomlTable *t,int d){
+    for(int i=0;i<t->entry_count;i++){
+        for(int j=0;j<d;j++)printf("  ");
+        printf("%s\n",t->entries[i].key);
     }
-    for (int i=0;i<t->sub_count;i++) {
-        for (int d=0; d<depth; d++) printf("  ");
-        printf("[%s]\n", t->subtables[i]->name);
-        dump_table(t->subtables[i], depth+1);
+    for(int i=0;i<t->sub_count;i++){
+        for(int j=0;j<d;j++)printf("  ");
+        printf("[%s]\n",t->subtables[i]->name);
+        dump_table(t->subtables[i],d+1);
     }
 }
+void toml_dump(const TomlDoc *doc){dump_table(doc->root,0);}
 
-void toml_dump(const TomlDoc *d) {
-    dump_table(d->root, 0);
+static void free_table(TomlTable *t){
+    if(!t)return;
+    for(int i=0;i<t->sub_count;i++)free_table(t->subtables[i]);
+    for(int i=0;i<t->arr_count;i++)free_table(t->table_array[i]);
+    free(t->entries); free(t->subtables); free(t->table_array); free(t);
 }
-
-static void free_table(TomlTable *t) {
-    if (!t) return;
-    for (int i=0;i<t->sub_count;i++) free_table(t->subtables[i]);
-    for (int i=0;i<t->arr_count;i++) free_table(t->table_array[i]);
-    free(t->entries);
-    free(t->subtables);
-    free(t->table_array);
-    free(t);
-}
-
-void toml_free(TomlDoc *d) {
-    if (!d) return;
+void toml_free(TomlDoc *d){
+    if(!d)return;
     free_table(d->root);
     free(d->errs.errors);
     free(d);
