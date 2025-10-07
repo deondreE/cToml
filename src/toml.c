@@ -286,6 +286,116 @@ double toml_get_float(const TomlTable *t, const char *k, double def) {
 }
 
 // ----------------------------------------------------------
+// Writer API
+// ----------------------------------------------------------
+
+static void write_escaped_string(FILE *f, const char *s) {
+    fputc('"', f);
+    for (; *s; s++) {
+        switch (*s) {
+            case '\\': fputs("\\\\", f); break;
+            case '"':  fputs("\\\"", f); break;
+            case '\n': fputs("\\n", f); break;
+            case '\r': fputs("\\r", f); break;
+            case '\t': fputs("\\t", f); break;
+            default: fputc(*s, f); break;
+        }
+    }
+    fputc('"', f);
+}
+
+// Write arrays: [1, 2, 3] or ["a", "b"]
+static void write_array(FILE *f, const TomlEntry *e) {
+    fprintf(f, "[");
+    for (int i = 0; i < e->value.array.length; i++) {
+        if (i > 0) fprintf(f, ", ");
+        switch (e->type) {
+            case TOML_ARRAY_INT:
+                fprintf(f, "%d", e->value.array.int_values[i]);
+                break;
+            case TOML_ARRAY_FLOAT:
+                fprintf(f, "%g", e->value.array.float_values[i]);
+                break;
+            case TOML_ARRAY_STRING:
+                write_escaped_string(f, e->value.array.string_values[i]);
+                break;
+            default:
+                break;
+        }
+    }
+    fprintf(f, "]");
+}
+
+static void write_indent(FILE *f, int level, int spaces) {
+    for (int i = 0; i < level * spaces; i++)
+        fputc(' ', f);
+}
+
+static void write_table(FILE *f, const TomlTable *t, int depth, int indent) {
+    // Write key-value pairs
+    for (int i = 0; i < t->entry_count; i++) {
+        const TomlEntry *e = &t->entries[i];
+        write_indent(f, depth, indent);
+        fprintf(f, "%s = ", e->key);
+        switch (e->type) {
+            case TOML_INT:
+                fprintf(f, "%d", e->value.int_val);
+                break;
+            case TOML_FLOAT:
+                fprintf(f, "%g", e->value.float_val);
+                break;
+            case TOML_BOOL:
+                fprintf(f, e->value.bool_val ? "true" : "false");
+                break;
+            case TOML_STRING:
+                write_escaped_string(f, e->value.str_val);
+                break;
+            case TOML_ARRAY_INT:
+            case TOML_ARRAY_FLOAT:
+            case TOML_ARRAY_STRING:
+                write_array(f, e);
+                break;
+            case TOML_DATETIME:
+                fprintf(f, "%s", e->value.str_val);
+                break;
+            default:
+                fprintf(f, "\"<unknown>\"");
+                break;
+        }
+        fprintf(f, "\n");
+    }
+
+    // Write subtables
+    for (int i = 0; i < t->sub_count; i++) {
+        fprintf(f, "\n");
+        const TomlTable *st = t->subtables[i];
+        write_indent(f, depth, indent);
+        fprintf(f, "[%s]\n", st->name);
+        write_table(f, st, depth + 1, indent);
+    }
+
+    // Write array-of-tables, if any
+    for (int i = 0; i < t->arr_count; i++) {
+        fprintf(f, "\n");
+        const TomlTable *inst = t->table_array[i];
+        write_indent(f, depth, indent);
+        fprintf(f, "[[%s]]\n", inst->name);
+        write_table(f, inst, depth + 1, indent);
+    }
+}
+
+int toml_write(const TomlDoc *doc, const char *filename,
+               const TomlWriteOptions *opts) {
+    if (!doc || !doc->root) return -1;
+    FILE *f = fopen(filename, "w");
+    if (!f) return -1;
+    int indent = (opts && opts->indent_spaces) ? opts->indent_spaces : 0;
+    write_table(f, doc->root, 0, indent);
+    fclose(f);
+    return 0;
+}
+
+// ----------------------------------------------------------
 // Cleanup
 // ----------------------------------------------------------
 

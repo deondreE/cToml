@@ -77,6 +77,14 @@ typedef struct {
     TomlErrorList errs;
 } TomlDoc;
 
+// Writer API
+typedef struct {
+    int indent_spaces; // default = 0
+} TomlWriteOptions;
+
+int toml_write(const TomlDoc *doc, const char *filename,
+               const TomlWriteOptions *opts);
+
 // API
 TomlDoc *toml_load(const char *filename);
 void toml_free(TomlDoc *doc);
