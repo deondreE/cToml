@@ -1,3 +1,25 @@
+title = "Advanced Parser"
+start_time = 2025-10-07T08:00:00Z
 
-name = "Deondre English"
-age = 32
+[numbers]
+set = [1, 2, 3]
+
+[server]
+host = "localhost"
+port = 8080
+secure = true
+
+[server.config]
+timeout = 30
+
+# implicit dotted keys
+database.main.user = "admin"
+database.main.pass = "pass123"
+
+[[users]]
+name = "Alice"
+age = 30
+
+[[users]]
+name = "Bob"
+age = 25
